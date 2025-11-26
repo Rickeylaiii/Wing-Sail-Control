@@ -61,13 +61,12 @@ unsigned long restartTime = 0;
 
 // MPU6050 variables
 Adafruit_MPU6050 mpu;
-float measuredAngle = 90;           // Initial value matching default servo angle
-// const float FILTER_FACTOR = 0.25;    // No longer needed - using Kalman filter
+float measuredAngle = 0.0f;         // Filtered yaw angle (degrees)
 bool mpuInitialized = false;        // MPU6050 initialization status
 
 // Kalman filter variables
 SimpleKalmanFilter kalmanX(1, 1, 0.01);  // SimpleKalmanFilter(e_mea, e_est, q)
-float gyroXoffset = 0;              // Gyroscope zero drift compensation
+float gyroZoffset = 0.0f;           // Gyroscope Z-axis zero drift compensation
 unsigned long timer;                // Timer for calculating dt between readings
 
 // FreeRTOS synchronization
@@ -193,22 +192,16 @@ bool initMPU6050() {
   vTaskDelay(pdMS_TO_TICKS(100));
   
   // Calibrate gyroscope - calculate zero drift offset
-  Serial.println("Calibrating gyroscope, keep the sensor still...");
+  Serial.println("Calibrating gyroscope (Z-axis), keep the sensor still...");
   for (int i = 0; i < 2000; i++) {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
-    gyroXoffset += g.gyro.x;
+    gyroZoffset += g.gyro.z;
     vTaskDelay(pdMS_TO_TICKS(1));
   }
-  gyroXoffset /= 2000;
-  Serial.print("Gyro X offset: ");
-  Serial.println(gyroXoffset);
-  
-  // Get initial angle from accelerometer for Kalman filter
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-  float initialAngle = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
-  // SimpleKalmanFilter doesn't need explicit initialization with angle
+  gyroZoffset /= 2000.0f;
+  Serial.print("Gyro Z offset: ");
+  Serial.println(gyroZoffset);
   
   // Initialize timer for dt calculation
   timer = micros();
@@ -219,27 +212,48 @@ bool initMPU6050() {
 
 // Read MPU6050 angle data using SimpleKalmanFilter
 float readMPUAngle() {
-  if (!mpuInitialized) return measuredAngle;
-  
-  float result = 0;
-  
+  if (!mpuInitialized) {
+    return mapFloat(constrain(measuredAngle, -90.0f, 90.0f), -90.0f, 90.0f, 0.0f, 180.0f);
+  }
+
+  float result = mapFloat(constrain(measuredAngle, -90.0f, 90.0f), -90.0f, 90.0f, 0.0f, 180.0f);
+
   if (xSemaphoreTake(angleMutex, portMAX_DELAY)) {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
-    
-    // Calculate angle from accelerometer (noisy but no long-term drift)
-    float accAngleX = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
-    
-    // Use SimpleKalmanFilter to smooth the accelerometer reading
-    // Note: This library is simpler and doesn't use gyroscope data directly
-    measuredAngle = kalmanX.updateEstimate(accAngleX);
-    
-    // Map to 0-180 degree range
-    result = mapFloat(constrain(measuredAngle, -90.0f, 90.0f), -90.0f, 90.0f, 0.0f, 180.0f);
-    
+
+    unsigned long now = micros();
+    float dt = (now - timer) / 1000000.0f;
+    timer = now;
+
+    // Guard against invalid or excessively large time steps
+    if (dt <= 0.0f || dt > 0.2f) {
+      dt = 0.02f; // Assume nominal 50 Hz update if timing glitch occurs
+    }
+
+    float gyroRateDeg = (g.gyro.z - gyroZoffset) * 180.0f / PI; // Convert rad/s to deg/s
+
+    static float rawYaw = 0.0f;
+    static bool yawInitialized = false;
+    if (!yawInitialized) {
+      rawYaw = measuredAngle;
+      yawInitialized = true;
+    }
+
+    rawYaw += gyroRateDeg * dt;
+
+    // Keep raw yaw within [-180, 180] to avoid overflow
+    if (rawYaw > 180.0f) rawYaw -= 360.0f;
+    if (rawYaw < -180.0f) rawYaw += 360.0f;
+
+    measuredAngle = kalmanX.updateEstimate(rawYaw);
+
+    float clamped = constrain(measuredAngle, -90.0f, 90.0f);
+    result = mapFloat(clamped, -90.0f, 90.0f, 0.0f, 180.0f);
+
     xSemaphoreGive(angleMutex);
   }
-  
+
   return result;
 }
 
