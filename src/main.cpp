@@ -42,8 +42,12 @@
 // FreeRTOS task definitions
 #define WEBSERVER_TASK_PRIORITY 3
 #define MPU_TASK_PRIORITY 2
+#define SERIAL_TASK_PRIORITY 2
 #define LED_TASK_PRIORITY 1
 #define STACK_SIZE 8192
+
+// Serial output settings
+#define SERIAL_PRINT_INTERVAL 100  // Print every 100ms
 
 // Web server
 WebServer server(80);
@@ -62,17 +66,30 @@ unsigned long restartTime = 0;
 // MPU6050 variables
 Adafruit_MPU6050 mpu;
 float measuredAngle = 0.0f;         // Filtered yaw angle (degrees)
-bool mpuInitialized = false;        // MPU6050 initialization status
+volatile bool mpuInitialized = false;  // MPU6050 initialization status (volatile for multi-task access)
 
 // Kalman filter variables
 SimpleKalmanFilter kalmanX(1, 1, 0.01);  // SimpleKalmanFilter(e_mea, e_est, q)
 float gyroZoffset = 0.0f;           // Gyroscope Z-axis zero drift compensation
 unsigned long timer;                // Timer for calculating dt between readings
 
+// Sensor data structure with timestamp for control loops
+struct SensorData {
+  float yawAngle;        // Filtered yaw angle (degrees, -90 to 90)
+  float rawYaw;          // Raw integrated yaw (degrees, -180 to 180)
+  float gyroRate;        // Angular velocity (deg/s)
+  float dt;              // Time step (seconds)
+  unsigned long timestamp; // Microsecond timestamp
+  bool valid;            // Data validity flag
+};
+
+SensorData currentSensorData = {0.0f, 0.0f, 0.0f, 0.0f, 0, false};
+
 // FreeRTOS synchronization
-SemaphoreHandle_t angleMutex;
-SemaphoreHandle_t wifiMutex;
-SemaphoreHandle_t ledMutex;
+SemaphoreHandle_t angleMutex;   // Protects sensor data
+SemaphoreHandle_t servoMutex;   // Protects servo state
+SemaphoreHandle_t wifiMutex;    // Protects WiFi config
+SemaphoreHandle_t ledMutex;     // Protects LED state
 
 // Structure to store WiFi configuration
 struct {
@@ -85,10 +102,12 @@ struct {
 void webServerTask(void *parameter);
 void mpuTask(void *parameter);
 void ledControlTask(void *parameter);
+void serialTask(void *parameter);
 void setServoAngle(int angle);
 float readMPUAngle();
 bool initMPU6050();
 float mapFloat();
+void processSerialCommand();
 
 float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
@@ -144,29 +163,26 @@ int angleToPulse(int angle) {
 
 // Set servo angle with thread safety
 void setServoAngle(int angle) {
-  // Take mutex to ensure thread safety
-  if (xSemaphoreTake(angleMutex, portMAX_DELAY)) {
-    // Limit angle to valid range
-    if (angle < 0) angle = 0;
-    if (angle > 180) angle = 180;
-    
-    // Convert angle to PWM value and write
-    int pulse = angleToPulse(angle);
+  // Limit angle to valid range
+  if (angle < 0) angle = 0;
+  if (angle > 180) angle = 180;
+  
+  // Convert angle to PWM value
+  int pulse = angleToPulse(angle);
+  
+  // Take servo mutex for atomic update
+  if (xSemaphoreTake(servoMutex, pdMS_TO_TICKS(100))) {
     ledcWrite(LEDC_CHANNEL, pulse);
     currentServoAngle = angle;
+    xSemaphoreGive(servoMutex);
     
-    // Indicate servo movement with LED (non-blocking)
-    digitalWrite(LED_PIN, HIGH); // Briefly turn off
-    vTaskDelay(pdMS_TO_TICKS(10)); // Non-blocking delay
-    digitalWrite(LED_PIN, LOW);  // Turn back on
-    
-    Serial.print("Servo angle set to: ");
+    // Print outside critical section to avoid blocking
+    Serial.print("Servo: ");
     Serial.print(angle);
-    Serial.print(" (PWM value: ");
-    Serial.print(pulse);
-    Serial.println(")");
-    
-    xSemaphoreGive(angleMutex);
+    Serial.print("° PWM:");
+    Serial.println(pulse);
+  } else {
+    Serial.println("ERROR: Failed to acquire servo mutex");
   }
 }
 
@@ -210,13 +226,12 @@ bool initMPU6050() {
   return true;
 }
 
-// Read MPU6050 angle data using SimpleKalmanFilter
-float readMPUAngle() {
+// Update sensor data with timestamp - called by MPU task
+void updateSensorData() {
   if (!mpuInitialized) {
-    return mapFloat(constrain(measuredAngle, -90.0f, 90.0f), -90.0f, 90.0f, 0.0f, 180.0f);
+    currentSensorData.valid = false;
+    return;
   }
-
-  float result = mapFloat(constrain(measuredAngle, -90.0f, 90.0f), -90.0f, 90.0f, 0.0f, 180.0f);
 
   if (xSemaphoreTake(angleMutex, portMAX_DELAY)) {
     sensors_event_t a, g, temp;
@@ -248,13 +263,36 @@ float readMPUAngle() {
 
     measuredAngle = kalmanX.updateEstimate(rawYaw);
 
-    float clamped = constrain(measuredAngle, -90.0f, 90.0f);
-    result = mapFloat(clamped, -90.0f, 90.0f, 0.0f, 180.0f);
+    // Update sensor data structure atomically
+    currentSensorData.yawAngle = measuredAngle;
+    currentSensorData.rawYaw = rawYaw;
+    currentSensorData.gyroRate = gyroRateDeg;
+    currentSensorData.dt = dt;
+    currentSensorData.timestamp = now;
+    currentSensorData.valid = true;
 
     xSemaphoreGive(angleMutex);
   }
+}
 
-  return result;
+// Get current sensor data (thread-safe)
+SensorData getSensorData() {
+  SensorData data;
+  if (xSemaphoreTake(angleMutex, portMAX_DELAY)) {
+    data = currentSensorData;
+    xSemaphoreGive(angleMutex);
+  }
+  return data;
+}
+
+// Read MPU6050 angle - returns mapped angle for web interface (0-180)
+float readMPUAngle() {
+  if (!mpuInitialized) {
+    return mapFloat(constrain(measuredAngle, -90.0f, 90.0f), -90.0f, 90.0f, 0.0f, 180.0f);
+  }
+  
+  float clamped = constrain(measuredAngle, -90.0f, 90.0f);
+  return mapFloat(clamped, -90.0f, 90.0f, 0.0f, 180.0f);
 }
 
 // Load WiFi configuration from EEPROM
@@ -332,8 +370,16 @@ bool connectToWiFi() {
 // Handle root page (Servo control page)
 void handleRoot() {
   String html = readFile("/index.html");
+  
+  // Read servo angle with mutex protection
+  int angle = 90; // Default value
+  if (xSemaphoreTake(servoMutex, pdMS_TO_TICKS(10))) {
+    angle = currentServoAngle;
+    xSemaphoreGive(servoMutex);
+  }
+  
   // Replace angle placeholder with current value
-  html.replace("%ANGLE%", String(currentServoAngle));
+  html.replace("%ANGLE%", String(angle));
   server.send(200, "text/html", html);
 }
 
@@ -396,21 +442,23 @@ void webServerTask(void *parameter) {
   }
 }
 
-// MPU sensor reading task
+// MPU sensor reading task - high priority for control loop timing
 void mpuTask(void *parameter) {
-  const TickType_t xDelay = pdMS_TO_TICKS(20); // 100ms reading interval
+  const TickType_t xDelay = pdMS_TO_TICKS(20); // 20ms = 50Hz update rate
+  TickType_t xLastWakeTime = xTaskGetTickCount();
   
   for (;;) {
     if (mpuInitialized) {
-      readMPUAngle(); // Read and update angle measurement
+      updateSensorData(); // Update sensor data with precise timing
     }
-    vTaskDelay(xDelay);
+    // Use vTaskDelayUntil for precise periodic execution (important for control loops)
+    vTaskDelayUntil(&xLastWakeTime, xDelay);
   }
 }
 
 // LED control task
 void ledControlTask(void *parameter) {
-  const TickType_t xDelay = pdMS_TO_TICKS(5000); // 50ms for LED control
+  const TickType_t xDelay = pdMS_TO_TICKS(50); // 50ms for LED control
   
   for (;;) {
     if (xSemaphoreTake(ledMutex, portMAX_DELAY)) {
@@ -435,6 +483,65 @@ void ledControlTask(void *parameter) {
   }
 }
 
+// Serial output task - prints key information with timing data
+void serialTask(void *parameter) {
+  const TickType_t xDelay = pdMS_TO_TICKS(SERIAL_PRINT_INTERVAL);
+  
+  for (;;) {
+    if (mpuInitialized) {
+      SensorData data = getSensorData();
+      
+      if (data.valid) {
+        // Read servo angle with mutex protection
+        int servoAngle = 0;
+        if (xSemaphoreTake(servoMutex, pdMS_TO_TICKS(10))) {
+          servoAngle = currentServoAngle;
+          xSemaphoreGive(servoMutex);
+        }
+        
+        // Format: MSG,yaw,gyro_rate,servo_angle,dt,timestamp
+        Serial.print("MSG,");
+        Serial.print(data.yawAngle, 2);
+        Serial.print(",");
+        Serial.print(data.gyroRate, 2);
+        Serial.print(",");
+        Serial.print(servoAngle);
+        Serial.print(",");
+        Serial.print(data.dt * 1000.0f, 2); // dt in milliseconds
+        Serial.print(",");
+        Serial.println(data.timestamp);
+      } else {
+        Serial.println("MSG,INVALID,INVALID,INVALID,INVALID,INVALID");
+      }
+    }
+    vTaskDelay(xDelay);
+  }
+}
+
+// Process serial commands (format: s<angle>)
+void processSerialCommand() {
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    
+    if (command.length() > 0 && command.charAt(0) == 's') {
+      // Extract angle from command (e.g., "s90" -> 90)
+      String angleStr = command.substring(1);
+      int angle = angleStr.toInt();
+      
+      if (angle >= 0 && angle <= 180) {
+        setServoAngle(angle);
+        Serial.print("OK: Servo set to ");
+        Serial.println(angle);
+      } else {
+        Serial.println("ERROR: Angle must be 0-180");
+      }
+    } else if (command.length() > 0) {
+      Serial.println("ERROR: Unknown command. Use s<angle> (e.g., s90)");
+    }
+  }
+}
+
 void setup() {
   // Initialize serial communication
   Serial.begin(115200);
@@ -446,8 +553,15 @@ void setup() {
   
   // Create mutexes
   angleMutex = xSemaphoreCreateMutex();
+  servoMutex = xSemaphoreCreateMutex();
   wifiMutex = xSemaphoreCreateMutex();
   ledMutex = xSemaphoreCreateMutex();
+  
+  // Verify mutex creation
+  if (!angleMutex || !servoMutex || !wifiMutex || !ledMutex) {
+    Serial.println("FATAL: Failed to create mutexes");
+    while(1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+  }
   
   // Initialize SPIFFS
   if (!SPIFFS.begin(true)) {
@@ -547,10 +661,20 @@ void setup() {
     NULL
   );
   
+  xTaskCreate(
+    serialTask,
+    "SerialTask",
+    STACK_SIZE,
+    NULL,
+    SERIAL_TASK_PRIORITY,
+    NULL
+  );
+  
   // FreeRTOS is now running, main loop will not be used
 }
 
 void loop() {
-  // Nothing to do here - FreeRTOS tasks are handling everything
-  vTaskDelay(portMAX_DELAY); // Prevent watchdog issues
+  // Process serial commands in the main loop
+  processSerialCommand();
+  vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to prevent tight loop
 }
