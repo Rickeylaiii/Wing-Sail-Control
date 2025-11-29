@@ -35,6 +35,7 @@
 #define SCL_PIN 6  // GPIO6 for SCL according to XIAO ESP32S3 pinout
 
 // WiFi configuration
+#define ENABLE_WIFI false        // Set to false for serial-only mode (no WiFi/WebServer)
 #define EEPROM_SIZE 512
 #define MAX_SSID_LENGTH 32
 #define MAX_PASSWORD_LENGTH 64
@@ -589,6 +590,9 @@ void setup() {
     Serial.println("MPU6050 initialization failed - continuing without angle measurement");
   }
   
+#if ENABLE_WIFI
+  Serial.println("WiFi mode enabled");
+  
   // Load WiFi configuration
   loadWiFiConfig();
   
@@ -632,8 +636,15 @@ void setup() {
     Serial.print("Then navigate to: http://");
     Serial.println(WiFi.softAPIP());
   }
+#else
+  Serial.println("WiFi disabled - Serial-only mode");
+  Serial.println("System ready for serial control");
+  Serial.println("Commands: s<angle> (e.g., s90 to set servo to 90 degrees)");
+  turnLedOn(); // Solid LED in serial mode
+#endif
   
   // Create FreeRTOS tasks
+#if ENABLE_WIFI
   xTaskCreate(
     webServerTask,    // Task function
     "WebServerTask",  // Name for debugging
@@ -642,6 +653,7 @@ void setup() {
     WEBSERVER_TASK_PRIORITY,  // Priority (higher number = higher priority)
     NULL              // Task handle
   );
+#endif
   
   xTaskCreate(
     mpuTask,
